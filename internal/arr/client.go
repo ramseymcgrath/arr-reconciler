@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +14,20 @@ import (
 
 	"github.com/ramseymcgrath/arr-reconciler/internal/config"
 )
+
+// StatusError is returned by do for a non-2xx HTTP response, exposing the code
+// so callers can react to specific statuses (e.g. treat 404 on a delete as
+// already-done rather than a failure).
+type StatusError struct {
+	Method string
+	Path   string
+	Code   int
+	Body   string
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("%s %s: status %d: %s", e.Method, e.Path, e.Code, e.Body)
+}
 
 // Client talks to a single Sonarr or Radarr v3 instance.
 type Client struct {
@@ -60,7 +75,7 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 		return fmt.Errorf("read response %s %s: %w", method, path, err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("%s %s: status %d: %s", method, path, resp.StatusCode, string(body))
+		return &StatusError{Method: method, Path: path, Code: resp.StatusCode, Body: string(body)}
 	}
 	if out == nil || len(body) == 0 {
 		return nil
@@ -124,13 +139,24 @@ func (c *Client) Queue(ctx context.Context) ([]QueueRecord, error) {
 
 // DeleteQueueItem removes an item from the queue, optionally removing it from
 // the download client and blocklisting the release so it is not re-grabbed.
+//
+// A 404 is treated as success: season-pack downloads produce several queue
+// records sharing one downloadId, so deleting the first (with removeFromClient)
+// drops the whole download and the sibling records vanish. A later delete of a
+// now-gone sibling 404s, but the desired end state — the item is gone — already
+// holds, so it is not an error.
 func (c *Client) DeleteQueueItem(ctx context.Context, id int64, removeFromClient, blocklist bool) error {
 	q := url.Values{}
 	q.Set("removeFromClient", strconv.FormatBool(removeFromClient))
 	q.Set("blocklist", strconv.FormatBool(blocklist))
 	q.Set("skipRedownload", "false")
 	path := "/api/v3/queue/" + strconv.FormatInt(id, 10)
-	return c.do(ctx, http.MethodDelete, path, q, nil)
+	err := c.do(ctx, http.MethodDelete, path, q, nil)
+	var se *StatusError
+	if errors.As(err, &se) && se.Code == http.StatusNotFound {
+		return nil
+	}
+	return err
 }
 
 // MediaFile is a file the arr instance believes exists on disk.

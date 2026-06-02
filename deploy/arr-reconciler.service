@@ -1,0 +1,44 @@
+[Unit]
+Description=arr-reconciler — autonomous Sonarr/Radarr reconciliation pass
+Documentation=https://github.com/ramseymcgrath/arr-reconciler
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=mediabot
+Group=mediabot
+
+ExecStart=/usr/local/bin/arr-reconciler -config /etc/arr-reconciler/config.json
+
+# --- Hardening -------------------------------------------------------------
+# Read-only view of the whole filesystem, then punch through only the paths
+# the reconciler legitimately needs to write: its state dir and the trash
+# dataset. Media roots are read-only (the tool never writes into the library).
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/tank/media
+ReadWritePaths=/var/lib/arr-reconciler /tank/trash
+StateDirectory=arr-reconciler
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+# Give a single pass plenty of room but don't let it run forever; this should
+# stay >= the in-code per-run timeout (30m).
+TimeoutStartSec=45min
+
+[Install]
+WantedBy=multi-user.target

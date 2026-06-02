@@ -1,0 +1,16 @@
+[Unit]
+Description=Run arr-reconciler periodically
+Documentation=https://github.com/ramseymcgrath/arr-reconciler
+
+[Timer]
+# First run 15 minutes after boot, then every 4 hours.
+OnBootSec=15min
+OnUnitActiveSec=4h
+# Spread the wakeup so it does not fire at the same instant on every host and
+# does not race in-flight imports on a predictable boundary.
+RandomizedDelaySec=10min
+# If the machine was asleep/off at the scheduled time, run as soon as it can.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

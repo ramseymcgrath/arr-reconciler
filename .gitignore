@@ -1,0 +1,13 @@
+# Built binary
+/arr-reconciler
+
+# Local config rendered from the template (may contain real API keys)
+/config.json
+
+# Runtime state (last report) and its mount dir
+/state.json
+/data/
+
+# Editor / OS cruft
+*.swp
+.DS_Store

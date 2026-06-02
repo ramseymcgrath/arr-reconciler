@@ -1,0 +1,65 @@
+{
+  "dry_run": false,
+  "http_timeout": "30s",
+  "state_file": "/var/lib/arr-reconciler/state.json",
+
+  "instances": [
+    {
+      "name": "sonarr",
+      "kind": "sonarr",
+      "base_url": "http://sonarr:8989",
+      "api_key": "${SONARR_API_KEY}"
+    },
+    {
+      "name": "radarr",
+      "kind": "radarr",
+      "base_url": "http://radarr:7878",
+      "api_key": "${RADARR_API_KEY}"
+    }
+  ],
+
+  "queue": {
+    "stalled_threshold": "2h",
+    "max_removals_per_run": 25,
+    "max_candidates_per_run": 200,
+    "batch_size": 50,
+    "blocklist": true
+  },
+
+  "safety": {
+    "delete_enabled": true,
+    "trash_dataset": "/storage/trash",
+    "trash_ttl": "336h",
+    "max_deletes_per_run": 50,
+    "max_bytes_per_run": 536870912000,
+    "min_orphan_age": "6h",
+    "max_candidates_per_run": 500,
+    "batch_size": 50,
+    "allowed_roots": [
+      "/storage/movies",
+      "/storage/tv"
+    ],
+    "protected_extensions": [".nfo", ".srt", ".sub", ".ass", ".ssa", ".vtt", ".idx", ".jpg", ".jpeg", ".png", ".tbn", ".txt"]
+  },
+
+  "claude": {
+    "api_key": "${CLAUDE_API_KEY}",
+    "model": "claude-sonnet-4-6",
+    "queue_model": "claude-haiku-4-5",
+    "orphan_model": "claude-sonnet-4-6",
+    "max_tokens": 4096,
+    "base_url": "${CLAUDE_BASE_URL}",
+    "gateway_token": "${CLAUDE_GATEWAY_TOKEN}",
+    "cache_ttl": "1h"
+  },
+
+  "notify": {
+    "webhook_url": ""
+  },
+
+  "llmobs": {
+    "endpoint": "${LLMOBS_ENDPOINT}",
+    "ml_app": "${ML_APP}",
+    "tags": ["env:home", "stack:media"]
+  }
+}

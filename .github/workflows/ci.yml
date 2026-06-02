@@ -10,12 +10,14 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: '1.23'
-          cache: true
+          # No go.sum (pure stdlib, zero dependencies), so module caching has
+          # nothing to key on; disable it to avoid a noisy cache-miss warning.
+          cache: false
 
       - name: Verify formatting
         run: |

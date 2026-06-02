@@ -49,6 +49,12 @@ type Safety struct {
 	// 50. Smaller batches keep each request well inside the context window and
 	// make a single bad response cost less.
 	BatchSize int `json:"batch_size"`
+	// RulesDisabled turns OFF tier-0 deterministic rules that auto-trash narrow,
+	// unambiguous junk (zero-byte/orphaned sidecars, sample clips) without a
+	// model. Rules are still subject to every hard rail before any move. They are
+	// ON by default (zero value); set this true to route everything through the
+	// models instead.
+	RulesDisabled bool `json:"rules_disabled"`
 }
 
 // Queue holds stuck-queue-item handling parameters.
@@ -68,6 +74,11 @@ type Queue struct {
 	// BatchSize is how many queue items are sent per model request. Defaults to
 	// 50.
 	BatchSize int `json:"batch_size"`
+	// GraceRuns requires an item to look stuck for this many CONSECUTIVE runs
+	// before it is eligible for removal, so a transiently stalled download that
+	// recovers on its own is never removed. 1 means act on first sighting (no
+	// grace). Defaults to 2.
+	GraceRuns int `json:"grace_runs"`
 }
 
 // Claude holds Anthropic API configuration.
@@ -107,6 +118,22 @@ type Notify struct {
 	WebhookURL string `json:"webhook_url"`
 }
 
+// Local configures the cheap local-model prefilter tier (Ollama). When Endpoint
+// is empty the tier is disabled and every candidate escalates to the frontier
+// model unchanged.
+type Local struct {
+	// Endpoint is the Ollama base URL, e.g. "http://ollama:11434". Empty
+	// disables the prefilter.
+	Endpoint string `json:"endpoint"`
+	// Model is the Ollama model tag, e.g. "qwen2.5:3b".
+	Model string `json:"model"`
+	// Timeout bounds a single classification call. Defaults to 1m.
+	Timeout Duration `json:"timeout"`
+}
+
+// Enabled reports whether the local prefilter tier is active.
+func (l Local) Enabled() bool { return l.Endpoint != "" }
+
 // LLMObs configures Datadog LLM Observability. Spans and evaluations are POSTed
 // to a local Datadog agent's EVP proxy (no API key required in agent mode). It
 // is disabled entirely when Endpoint is empty.
@@ -132,6 +159,7 @@ type Config struct {
 	Claude      Claude     `json:"claude"`
 	Notify      Notify     `json:"notify"`
 	LLMObs      LLMObs     `json:"llmobs"`
+	Local       Local      `json:"local"`
 	DryRun      bool       `json:"dry_run"`
 	HTTPTimeout Duration   `json:"http_timeout"`
 	StateFile   string     `json:"state_file"`
@@ -214,6 +242,15 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Queue.BatchSize == 0 {
 		c.Queue.BatchSize = 50
+	}
+	if c.Queue.GraceRuns == 0 {
+		c.Queue.GraceRuns = 2
+	}
+	if c.Local.Model == "" {
+		c.Local.Model = "qwen2.5:3b"
+	}
+	if c.Local.Timeout == 0 {
+		c.Local.Timeout = Duration(time.Minute)
 	}
 	if c.Safety.MaxDeletesPerRun == 0 {
 		c.Safety.MaxDeletesPerRun = 50

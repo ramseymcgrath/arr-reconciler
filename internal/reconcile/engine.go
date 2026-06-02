@@ -16,19 +16,22 @@ import (
 	"github.com/ramseymcgrath/arr-reconciler/internal/claude"
 	"github.com/ramseymcgrath/arr-reconciler/internal/config"
 	"github.com/ramseymcgrath/arr-reconciler/internal/llmobs"
+	"github.com/ramseymcgrath/arr-reconciler/internal/local"
 	"github.com/ramseymcgrath/arr-reconciler/internal/notify"
 	"github.com/ramseymcgrath/arr-reconciler/internal/trash"
 )
 
 // Engine runs a single reconciliation pass across all instances.
 type Engine struct {
-	cfg     *config.Config
-	clients []*arr.Client
-	brain   *claude.Client
-	bin     *trash.Bin
-	note    *notify.Notifier
-	tracer  *llmobs.Tracer
-	log     *slog.Logger
+	cfg       *config.Config
+	clients   []*arr.Client
+	brain     *claude.Client
+	prefilter *local.Classifier
+	bin       *trash.Bin
+	note      *notify.Notifier
+	tracer    *llmobs.Tracer
+	grace     *graceStore
+	log       *slog.Logger
 }
 
 // New builds an Engine from config.
@@ -49,9 +52,10 @@ func New(cfg *config.Config, log *slog.Logger) *Engine {
 			CacheTTLSeconds: int(cfg.Claude.CacheTTL.Std().Seconds()),
 			Timeout:         cfg.Claude.Timeout.Std(),
 		}),
-		note:   notify.New(cfg.Notify.WebhookURL, cfg.HTTPTimeout.Std()),
-		tracer: llmobs.New(cfg.LLMObs.Endpoint, cfg.LLMObs.MLApp, cfg.LLMObs.Tags, cfg.HTTPTimeout.Std()),
-		log:    log,
+		prefilter: local.New(cfg.Local.Endpoint, cfg.Local.Model, cfg.Local.Timeout.Std()),
+		note:      notify.New(cfg.Notify.WebhookURL, cfg.HTTPTimeout.Std()),
+		tracer:    llmobs.New(cfg.LLMObs.Endpoint, cfg.LLMObs.MLApp, cfg.LLMObs.Tags, cfg.HTTPTimeout.Std()),
+		log:       log,
 	}
 	if cfg.Safety.DeleteEnabled {
 		e.bin = trash.New(cfg.Safety.TrashDataset, cfg.Safety.TrashTTL.Std())
@@ -70,6 +74,17 @@ type Report struct {
 	Skipped        []ActionRecord `json:"skipped"`
 	Errors         []string       `json:"errors"`
 	TrashPurged    int            `json:"trash_purged"`
+	Funnel         FunnelStats    `json:"funnel"`
+}
+
+// FunnelStats counts how many candidates each tier handled, so the cost funnel
+// can be tuned. RuleJunk + LocalKeep never reach the frontier model; Escalated
+// is what Claude actually saw.
+type FunnelStats struct {
+	Candidates int `json:"candidates"` // total after the hard rails pre-filter
+	RuleJunk   int `json:"rule_junk"`  // tier-0: auto-trashed by deterministic rule
+	LocalKeep  int `json:"local_keep"` // tier-1: dropped as safe by the local model
+	Escalated  int `json:"escalated"`  // tier-2: sent to the frontier model (Claude)
 }
 
 // ActionRecord captures a single action (or non-action) taken on a candidate.
@@ -88,6 +103,17 @@ func (e *Engine) Run(ctx context.Context) (*Report, error) {
 	// Open one LLM Observability trace per run (no-op when disabled). Every
 	// Claude call below becomes a child span, with per-decision evaluations.
 	trace := e.tracer.StartRun("reconcile_run")
+
+	// Load the queue-grace streak store and start this run's accounting. Items
+	// not seen this run have their streaks dropped at commit.
+	e.grace = loadGraceStore(e.cfg.StateFile)
+	e.grace.begin()
+
+	// Warm the local prefilter model so the first batch isn't slowed by a cold
+	// load (best-effort; a failure just means the first call pays the load cost).
+	if err := e.prefilter.Preload(ctx); err != nil {
+		e.log.Warn("local prefilter preload failed", "err", err)
+	}
 
 	for _, c := range e.clients {
 		if err := e.reconcileQueue(ctx, c, rep, trace); err != nil {
@@ -109,6 +135,9 @@ func (e *Engine) Run(ctx context.Context) (*Report, error) {
 	}
 
 	rep.Finished = time.Now()
+	if err := e.grace.commit(); err != nil {
+		e.log.Warn("persist queue-grace failed", "err", err)
+	}
 	if err := trace.Flush(ctx); err != nil {
 		e.log.Warn("llmobs flush failed", "err", err)
 	}
@@ -161,12 +190,24 @@ func (e *Engine) reconcileQueue(ctx context.Context, c *arr.Client, rep *Report,
 	}
 	threshold := e.cfg.Queue.StalledThreshold.Std()
 
-	// Identify candidates: items that look stuck.
+	// Identify candidates: items that look stuck AND have looked stuck for at
+	// least GraceRuns consecutive runs (so a transient stall that recovers is
+	// never removed). Every stuck item bumps its streak; only those at/over the
+	// threshold proceed.
 	refIndex := make(map[string]arr.QueueRecord)
 	var candidates []queueCandidate
 	now := time.Now()
+	grace := e.cfg.Queue.GraceRuns
 	for _, r := range records {
 		if !isStuck(r, now, threshold) {
+			continue
+		}
+		streak := e.grace.seen(queueGraceKey(c.Name(), r))
+		if streak < grace {
+			rep.Skipped = append(rep.Skipped, ActionRecord{
+				Instance: c.Name(), Item: r.Title, Action: "queue-grace",
+				Reason: fmt.Sprintf("stuck %d/%d consecutive runs; waiting", streak, grace),
+			})
 			continue
 		}
 		ref := fmt.Sprintf("q-%d", r.ID)
@@ -237,6 +278,12 @@ func (e *Engine) reconcileQueue(ctx context.Context, c *arr.Client, rep *Report,
 			e.recordDecision(trace, dspan, parent, "decision:"+d.Ref, r.Title, d, "kept")
 		}
 	}
+
+	// Tier-1 local prefilter: drop items the local model is confident are fine
+	// (still progressing / transient), escalate the rest. No tier-0 rules here —
+	// queue removal hinges on free-text status messages, not structural patterns.
+	rep.Funnel.Candidates += len(candidates)
+	candidates = e.funnelQueue(ctx, rep, candidates)
 
 	runBatched(e, ctx, c, rep, trace, "queue_triage", e.cfg.Claude.QueueModel, queueSystemPrompt,
 		e.cfg.Queue.MaxCandidatesPerRun, e.cfg.Queue.BatchSize, candidates, apply)
@@ -586,9 +633,120 @@ func (e *Engine) reconcileFiles(ctx context.Context, c *arr.Client, rep *Report,
 		e.recordDecision(trace, dspan, parent, "decision:"+d.Ref, o.path, d, "executed")
 	}
 
+	// ---- Funnel: tiers 0 and 1 thin the set before the frontier model -------
+	// Tier 0 (rules) auto-trash dead-obvious junk via the same destructive path
+	// (apply with a synthesized decision) — still rail-gated. Tier 1 (local
+	// model) drops only confident "keep"; junk + uncertain + anything unparseable
+	// escalate. The frontier model (tier 2) sees only what survives.
+	rep.Funnel.Candidates += len(candidates)
+	escalated := e.funnelOrphans(ctx, c, rep, trace, candidates, refIndex, apply)
+
 	runBatched(e, ctx, c, rep, trace, "orphan_triage", e.cfg.Claude.OrphanModel, orphanSystemPrompt,
-		e.cfg.Safety.MaxCandidatesPerRun, e.cfg.Safety.BatchSize, candidates, apply)
+		e.cfg.Safety.MaxCandidatesPerRun, e.cfg.Safety.BatchSize, escalated, apply)
 	return nil
+}
+
+// funnelQueue applies the tier-1 local prefilter to stuck queue candidates,
+// returning only those that must escalate to the frontier model. A local "keep"
+// means the item looks like it is still progressing or in a transient state —
+// the safe, non-destructive direction — so it is dropped. Junk + uncertain +
+// anything unparseable escalate. With the prefilter disabled, all candidates
+// escalate unchanged.
+func (e *Engine) funnelQueue(
+	ctx context.Context, rep *Report, candidates []queueCandidate,
+) []queueCandidate {
+	if !e.prefilter.Enabled() || len(candidates) == 0 {
+		rep.Funnel.Escalated += len(candidates)
+		return candidates
+	}
+	items := make([]local.Item, len(candidates))
+	for i, cand := range candidates {
+		status := cand.Status
+		if cand.ErrorMessage != "" {
+			status += "; err=" + cand.ErrorMessage
+		}
+		items[i] = local.Item{
+			Ref:  cand.Ref,
+			Text: fmt.Sprintf("%q status=%s tracked=%s age~%dh remaining=%d%%", cand.Title, status, cand.TrackedDownloadStatus, cand.AgeHours, cand.PercentRemaining),
+		}
+	}
+	verdicts := e.prefilter.Classify(ctx, items)
+
+	var escalated []queueCandidate
+	for _, cand := range candidates {
+		if verdicts[cand.Ref] == local.Keep {
+			rep.Funnel.LocalKeep++
+			rep.Skipped = append(rep.Skipped, ActionRecord{
+				Item: cand.Title, Action: "queue-keep",
+				Reason: "tier-1 local prefilter: still progressing / transient",
+			})
+			continue
+		}
+		escalated = append(escalated, cand)
+	}
+	rep.Funnel.Escalated += len(escalated)
+	return escalated
+}
+
+// funnelOrphans applies tier-0 rules and the tier-1 local prefilter to the
+// orphan candidates and returns only those that must escalate to the frontier
+// model. Rule-junk is acted on immediately through apply (a synthesized "trash"
+// decision, so it still passes every hard rail and is recorded/capped like any
+// other). Local "keep" is dropped (the safe direction — nothing destroyed).
+// Everything else escalates. With the prefilter disabled, only tier 0 runs and
+// the rest escalate unchanged.
+func (e *Engine) funnelOrphans(
+	ctx context.Context, c *arr.Client, rep *Report, trace *llmobs.Trace,
+	candidates []orphanCandidate, refIndex map[string]fileOnDisk,
+	apply func(d claude.Decision, dspan, parent *llmobs.Span),
+) []orphanCandidate {
+
+	// Tier 0: deterministic rules.
+	var afterRules []orphanCandidate
+	for _, cand := range candidates {
+		o := refIndex[cand.Ref]
+		if !e.cfg.Safety.RulesDisabled && classifyOrphanRule(o.path, o.size) == ruleJunk {
+			rep.Funnel.RuleJunk++
+			apply(claude.Decision{
+				Ref:        cand.Ref,
+				Action:     "trash",
+				Reason:     "tier-0 rule: obvious orphan junk (" + cand.Ext + ")",
+				Confidence: 1,
+			}, trace.Start(), trace.Root())
+			continue
+		}
+		afterRules = append(afterRules, cand)
+	}
+
+	// Tier 1: local prefilter. Disabled -> everything escalates.
+	if !e.prefilter.Enabled() || len(afterRules) == 0 {
+		rep.Funnel.Escalated += len(afterRules)
+		return afterRules
+	}
+	items := make([]local.Item, len(afterRules))
+	for i, cand := range afterRules {
+		items[i] = local.Item{
+			Ref:  cand.Ref,
+			Text: fmt.Sprintf("%s (ext=%s, %dMB, age~%dh)", cand.Path, cand.Ext, cand.SizeMB, cand.AgeHours),
+		}
+	}
+	verdicts := e.prefilter.Classify(ctx, items)
+
+	var escalated []orphanCandidate
+	for _, cand := range afterRules {
+		if verdicts[cand.Ref] == local.Keep {
+			rep.Funnel.LocalKeep++
+			o := refIndex[cand.Ref]
+			rep.Skipped = append(rep.Skipped, ActionRecord{
+				Instance: c.Name(), Item: o.path, Action: "orphan-keep",
+				Reason: "tier-1 local prefilter: keep", Bytes: o.size,
+			})
+			continue
+		}
+		escalated = append(escalated, cand)
+	}
+	rep.Funnel.Escalated += len(escalated)
+	return escalated
 }
 
 // passesRails enforces the hard safety guardrails that no LLM decision can
@@ -672,6 +830,10 @@ func (r *Report) Summary() string {
 	fmt.Fprintf(&b, "arr-reconciler [%s] %s\n", mode, r.Finished.Format(time.RFC3339))
 	fmt.Fprintf(&b, "queue removed: %d | orphans trashed: %d | missing handled: %d | skipped: %d | errors: %d | trash purged: %d\n",
 		len(r.QueueRemoved), len(r.OrphansTrashed), len(r.MissingFiles), len(r.Skipped), len(r.Errors), r.TrashPurged)
+	if f := r.Funnel; f.Candidates > 0 {
+		fmt.Fprintf(&b, "funnel: %d candidates -> rule-junk %d, local-keep %d, escalated to model %d\n",
+			f.Candidates, f.RuleJunk, f.LocalKeep, f.Escalated)
+	}
 
 	var trashedBytes int64
 	for _, a := range r.OrphansTrashed {

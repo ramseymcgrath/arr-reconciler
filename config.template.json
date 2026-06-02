@@ -23,6 +23,7 @@
     "max_removals_per_run": 25,
     "max_candidates_per_run": 200,
     "batch_size": 50,
+    "grace_runs": 2,
     "blocklist": true
   },
 
@@ -35,6 +36,7 @@
     "min_orphan_age": "6h",
     "max_candidates_per_run": 500,
     "batch_size": 50,
+    "rules_disabled": false,
     "allowed_roots": [
       "/storage/movies",
       "/storage/tv"
@@ -61,5 +63,11 @@
     "endpoint": "${LLMOBS_ENDPOINT}",
     "ml_app": "${ML_APP}",
     "tags": ["env:home", "stack:media"]
+  },
+
+  "local": {
+    "endpoint": "${LOCAL_ENDPOINT}",
+    "model": "qwen2.5:3b",
+    "timeout": "1m"
   }
 }

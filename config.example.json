@@ -23,6 +23,7 @@
     "max_removals_per_run": 25,
     "max_candidates_per_run": 200,
     "batch_size": 50,
+    "grace_runs": 2,
     "blocklist": true
   },
 
@@ -35,6 +36,7 @@
     "min_orphan_age": "6h",
     "max_candidates_per_run": 500,
     "batch_size": 50,
+    "rules_disabled": false,
     "allowed_roots": [
       "/tank/media/movies",
       "/tank/media/tv"
@@ -61,5 +63,11 @@
     "endpoint": "http://datadog-agent:8126",
     "ml_app": "arr-reconciler",
     "tags": ["env:home", "stack:media"]
+  },
+
+  "local": {
+    "endpoint": "http://ollama:11434",
+    "model": "qwen2.5:3b",
+    "timeout": "1m"
   }
 }

@@ -23,9 +23,13 @@ RENDERED=/etc/arr-reconciler/config.json
 : "${CLAUDE_BASE_URL:=https://api.anthropic.com}"
 : "${CLAUDE_GATEWAY_TOKEN:=}"
 
+# Optional local-model prefilter tier (Ollama). Empty disables it: every
+# candidate then escalates straight to the frontier model.
+: "${LOCAL_ENDPOINT:=}"
+
 # Only substitute the variables we explicitly name, so a literal $ elsewhere in
 # the template is left untouched.
-envsubst '${CLAUDE_API_KEY} ${CLAUDE_BASE_URL} ${CLAUDE_GATEWAY_TOKEN} ${SONARR_API_KEY} ${RADARR_API_KEY} ${LLMOBS_ENDPOINT} ${ML_APP}' \
+envsubst '${CLAUDE_API_KEY} ${CLAUDE_BASE_URL} ${CLAUDE_GATEWAY_TOKEN} ${SONARR_API_KEY} ${RADARR_API_KEY} ${LLMOBS_ENDPOINT} ${ML_APP} ${LOCAL_ENDPOINT}' \
 	< "$TEMPLATE" > "$RENDERED"
 
 exec /usr/local/bin/arr-reconciler -config "$RENDERED" "$@"

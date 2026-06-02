@@ -1,9 +1,5 @@
 # arr-reconciler
 
-[![CI](https://github.com/ramseymcgrath/arr-reconciler/actions/workflows/ci.yml/badge.svg)](https://github.com/ramseymcgrath/arr-reconciler/actions/workflows/ci.yml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/ramseymcgrath/arr-reconciler)](https://goreportcard.com/report/github.com/ramseymcgrath/arr-reconciler)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-
 An autonomous reconciliation agent for a Sonarr/Radarr stack. On a schedule it:
 
 1. **Stuck queue items** — pulls the download queue from each instance, flags items that look stalled/failed, asks Claude to triage each one, and removes (+ blocklists) the ones Claude judges dead so a different release gets grabbed.
@@ -140,6 +136,31 @@ Each task uses a model matched to its risk and complexity (all overridable in `c
 - **`model`** (default `claude-sonnet-4-6`) — fallback when a per-task model is unset.
 
 Candidate payloads are kept minimal and continuous values are bucketed (age, size), so an unchanged set of candidates serializes identically across runs — letting the AI Gateway response cache hit instead of drifting every run.
+
+## Tiered triage funnel
+
+To keep the frontier model off dead-obvious work, candidates pass through a cost funnel before Claude sees them:
+
+```
+tier 0  rules (free)        — orphans: auto-trash narrow, unambiguous junk
+                              (zero-byte / orphaned .metathumb/.xml sidecars,
+                              sample clips). Still rail-gated; toggle with
+                              safety.rules_disabled.
+tier 1  local model (cheap) — an Ollama model (default qwen2.5:3b) labels each
+                              remaining candidate keep / junk / uncertain.
+                              Configure under "local"; empty endpoint disables it.
+tier 2  Claude (frontier)   — makes the final call on everything that escalated.
+```
+
+**Safety posture (load-bearing): the cheap tiers may only finalize the *safe*, non-destructive direction.** The local model's `keep` drops an item from the expensive prompt (nothing is destroyed); its `junk` and `uncertain` — and *any* transport/parse failure — escalate to Claude (fail-open). The local model never decides a removal or relocation. Tier-0 rule-junk is the one cheap-tier action that is destructive, and it still passes every hard rail (allowlist, protected ext, min-age, per-run caps) and is dry-run-gated like any other trash.
+
+Each run logs the funnel so you can tune it:
+
+```
+funnel: 44004 candidates -> rule-junk 41230, local-keep 2100, escalated to model 674
+```
+
+**Queue grace** (`queue.grace_runs`, default 2): a stuck item must look stuck for that many *consecutive* runs before it's eligible for removal, so a transiently stalled download that recovers on its own is never touched. Streaks persist in a `queue-grace.json` sidecar next to the state file and reset when an item recovers or disappears.
 
 ## Notes
 

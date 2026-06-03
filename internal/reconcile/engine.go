@@ -420,32 +420,78 @@ func runBatched[T any](
 		batchSize = len(candidates)
 	}
 
+	// Split into chunks of batchSize; each chunk is one model request (one llm
+	// span). The chunks are dispatched either synchronously (one HTTP call each)
+	// or together via the Message Batches API (50% cost, async) per config.
+	type chunk struct {
+		label   string
+		payload string
+	}
+	var chunks []chunk
 	for start := 0; start < len(candidates); start += batchSize {
 		end := start + batchSize
 		if end > len(candidates) {
 			end = len(candidates)
 		}
-		batch := candidates[start:end]
-
-		payload, err := json.Marshal(batch)
+		payload, err := json.Marshal(candidates[start:end])
 		if err != nil {
 			rep.Errors = append(rep.Errors, fmt.Sprintf("%s marshal %s [%d:%d]: %v", name, c.Name(), start, end, err))
 			continue
 		}
+		chunks = append(chunks, chunk{label: fmt.Sprintf("%s[%d:%d]", name, start, end), payload: string(payload)})
+	}
+	if len(chunks) == 0 {
+		return
+	}
 
+	dispatch := func(label, payload string, res *claude.Result, callErr error) {
 		span := trace.Start()
-		res, err := e.brain.Decide(ctx, model, system, string(payload))
-		trace.Finish(span, trace.Root(), name+":"+c.Name(), e.llmFinish(model, string(payload), res, err))
-		if err != nil {
-			rep.Errors = append(rep.Errors, fmt.Sprintf("%s %s [%d:%d]: %v", name, c.Name(), start, end, err))
-			e.log.Error("triage batch failed", "kind", name, "instance", c.Name(), "err", err)
-			continue
+		trace.Finish(span, trace.Root(), name+":"+c.Name(), e.llmFinish(model, payload, res, callErr))
+		if callErr != nil {
+			rep.Errors = append(rep.Errors, fmt.Sprintf("%s %s %s: %v", name, c.Name(), label, callErr))
+			e.log.Error("triage batch failed", "kind", name, "instance", c.Name(), "err", callErr)
+			return
 		}
-
 		for _, d := range res.Decisions {
-			dspan := trace.Start()
-			apply(d, dspan, span)
+			apply(d, trace.Start(), span)
 		}
+	}
+
+	if e.cfg.Claude.BatchMode {
+		// One Message Batch for all chunks: 50% cheaper, asynchronous.
+		reqs := make([]claude.BatchRequest, len(chunks))
+		for i, ch := range chunks {
+			reqs[i] = claude.BatchRequest{
+				CustomID: fmt.Sprintf("c%d", i),
+				Model:    model,
+				System:   system,
+				Payload:  ch.payload,
+			}
+		}
+		bctx, cancel := context.WithTimeout(ctx, e.cfg.Claude.BatchTimeout.Std())
+		defer cancel()
+		e.log.Info("submitting message batch", "kind", name, "instance", c.Name(), "requests", len(reqs))
+		results, err := e.brain.DecideBatch(bctx, reqs, e.cfg.Claude.BatchPollInterval.Std())
+		if err != nil {
+			rep.Errors = append(rep.Errors, fmt.Sprintf("%s batch %s: %v", name, c.Name(), err))
+			e.log.Error("message batch failed", "kind", name, "instance", c.Name(), "err", err)
+			return
+		}
+		byID := make(map[string]claude.BatchResult, len(results))
+		for _, r := range results {
+			byID[r.CustomID] = r
+		}
+		for i, ch := range chunks {
+			br := byID[fmt.Sprintf("c%d", i)]
+			dispatch(ch.label, ch.payload, br.Result, br.Err)
+		}
+		return
+	}
+
+	// Synchronous: one HTTP call per chunk.
+	for _, ch := range chunks {
+		res, err := e.brain.Decide(ctx, model, system, ch.payload)
+		dispatch(ch.label, ch.payload, res, err)
 	}
 }
 
@@ -718,35 +764,21 @@ func (e *Engine) funnelOrphans(
 		afterRules = append(afterRules, cand)
 	}
 
-	// Tier 1: local prefilter. Disabled -> everything escalates.
-	if !e.prefilter.Enabled() || len(afterRules) == 0 {
-		rep.Funnel.Escalated += len(afterRules)
-		return afterRules
+	// Bound the set to this run's cap; the frontier model would only act on this
+	// many anyway and overflow defers to the next run.
+	if max := e.cfg.Safety.MaxCandidatesPerRun; max > 0 && len(afterRules) > max {
+		afterRules = afterRules[:max]
 	}
-	items := make([]local.Item, len(afterRules))
-	for i, cand := range afterRules {
-		items[i] = local.Item{
-			Ref:  cand.Ref,
-			Text: fmt.Sprintf("%s (ext=%s, %dMB, age~%dh)", cand.Path, cand.Ext, cand.SizeMB, cand.AgeHours),
-		}
-	}
-	verdicts := e.prefilter.Classify(ctx, items)
 
-	var escalated []orphanCandidate
-	for _, cand := range afterRules {
-		if verdicts[cand.Ref] == local.Keep {
-			rep.Funnel.LocalKeep++
-			o := refIndex[cand.Ref]
-			rep.Skipped = append(rep.Skipped, ActionRecord{
-				Instance: c.Name(), Item: o.path, Action: "orphan-keep",
-				Reason: "tier-1 local prefilter: keep", Bytes: o.size,
-			})
-			continue
-		}
-		escalated = append(escalated, cand)
-	}
-	rep.Funnel.Escalated += len(escalated)
-	return escalated
+	// No tier-1 local prefilter on the orphan path. Orphans are leftover files,
+	// so after tier-0 rules skim the obvious junk the residue is genuinely
+	// ambiguous — the local model classifies almost none of it as a confident
+	// "keep" (it correctly escalates), while the per-batch latency on a shared
+	// GPU is real. The rules tier is the orphan-path win; the frontier model
+	// adjudicates the rest. (The local tier is used on the queue path instead,
+	// where it can spot transient-recover items.)
+	rep.Funnel.Escalated += len(afterRules)
+	return afterRules
 }
 
 // passesRails enforces the hard safety guardrails that no LLM decision can

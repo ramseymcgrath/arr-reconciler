@@ -92,10 +92,18 @@ For each candidate you are given, output a label:
 
 Bias strongly toward "keep" and "uncertain". Only say "junk" when it is obvious. A human-reviewed stronger model re-checks everything that is not "keep", so over-escalating is cheap and safe, but wrongly labeling a real file "keep"... is fine (it just won't be cleaned). Never invent items. Respond ONLY with JSON matching the schema.`
 
+// batchSize bounds how many items go in one /api/chat call. A small local model
+// is far slower per item than a frontier API, so a large batch easily exceeds
+// the request timeout; keeping batches small keeps each call fast and means one
+// slow/failed batch only costs its own items (which fail open).
+const batchSize = 20
+
 // Classify labels each item. The returned map is keyed by Item.Ref. Any item the
 // model omits, or any transport/parse failure, yields Uncertain for the affected
 // items so the caller escalates them (fail-open). A nil Classifier returns all
-// Uncertain, making the whole tier a transparent pass-through.
+// Uncertain, making the whole tier a transparent pass-through. Items are sent in
+// small batches; a batch that errors leaves its items Uncertain without
+// affecting the others.
 func (c *Classifier) Classify(ctx context.Context, items []Item) map[string]Verdict {
 	out := make(map[string]Verdict, len(items))
 	// Default everything to Uncertain first; we only downgrade to Keep/Junk on a
@@ -107,9 +115,23 @@ func (c *Classifier) Classify(ctx context.Context, items []Item) map[string]Verd
 		return out
 	}
 
+	for start := 0; start < len(items); start += batchSize {
+		end := start + batchSize
+		if end > len(items) {
+			end = len(items)
+		}
+		c.classifyBatch(ctx, items[start:end], out)
+	}
+	return out
+}
+
+// classifyBatch classifies one small batch, writing Keep/Junk into out for items
+// the model labels confidently. On any error it writes nothing (items keep their
+// Uncertain default and escalate).
+func (c *Classifier) classifyBatch(ctx context.Context, batch []Item, out map[string]Verdict) {
 	var sb strings.Builder
 	sb.WriteString("Classify these candidates:\n")
-	for _, it := range items {
+	for _, it := range batch {
 		fmt.Fprintf(&sb, "- id=%s: %s\n", it.Ref, it.Text)
 	}
 
@@ -118,7 +140,7 @@ func (c *Classifier) Classify(ctx context.Context, items []Item) map[string]Verd
 		Stream:    false,
 		KeepAlive: -1,
 		Format:    classifySchema,
-		Options:   chatOptions{Temperature: 0, Seed: 42, NumCtx: 8192},
+		Options:   chatOptions{Temperature: 0, Seed: 42, NumCtx: 4096},
 		Messages: []chatMessage{
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: sb.String()},
@@ -127,12 +149,11 @@ func (c *Classifier) Classify(ctx context.Context, items []Item) map[string]Verd
 
 	var resp chatResponse
 	if err := c.post(ctx, req, &resp); err != nil {
-		return out // all Uncertain -> all escalate
+		return // items stay Uncertain -> escalate
 	}
-
 	var parsed classifyResult
 	if err := json.Unmarshal([]byte(resp.Message.Content), &parsed); err != nil {
-		return out
+		return
 	}
 	for _, r := range parsed.Results {
 		if _, ok := out[r.ID]; !ok {
@@ -147,7 +168,6 @@ func (c *Classifier) Classify(ctx context.Context, items []Item) map[string]Verd
 			out[r.ID] = Uncertain
 		}
 	}
-	return out
 }
 
 func (c *Classifier) post(ctx context.Context, body any, out *chatResponse) error {

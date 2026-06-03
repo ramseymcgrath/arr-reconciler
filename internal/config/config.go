@@ -107,6 +107,17 @@ type Claude struct {
 	// cf-aig-cache-ttl so identical requests within the window are served from
 	// the gateway cache. Only meaningful with a gateway BaseURL.
 	CacheTTL Duration `json:"cache_ttl"`
+	// BatchMode routes triage through the Anthropic Message Batches API (50% off
+	// token cost, asynchronous). The reconciler submits one batch per path and
+	// polls until it ends before applying decisions, so a run takes longer but
+	// every Claude call is half price. Defaults to false (synchronous).
+	BatchMode bool `json:"batch_mode"`
+	// BatchPollInterval is how often a submitted batch is polled for completion.
+	// Defaults to 30s. Only used when BatchMode is true.
+	BatchPollInterval Duration `json:"batch_poll_interval"`
+	// BatchTimeout bounds the whole submit+poll+fetch cycle for one batch.
+	// Defaults to 1h (batches usually finish in minutes; hard cap is 24h).
+	BatchTimeout Duration `json:"batch_timeout"`
 	// Timeout bounds a single Messages API call. Model calls are far slower than
 	// the arr REST calls (HTTPTimeout), so this is separate and longer.
 	// Defaults to 2m.
@@ -227,6 +238,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Claude.Timeout == 0 {
 		c.Claude.Timeout = Duration(2 * time.Minute)
+	}
+	if c.Claude.BatchPollInterval == 0 {
+		c.Claude.BatchPollInterval = Duration(30 * time.Second)
+	}
+	if c.Claude.BatchTimeout == 0 {
+		c.Claude.BatchTimeout = Duration(time.Hour)
 	}
 	if c.HTTPTimeout == 0 {
 		c.HTTPTimeout = Duration(30 * time.Second)

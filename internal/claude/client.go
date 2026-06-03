@@ -10,6 +10,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/anthropics/anthropic-sdk-go/option"
 )
 
 const anthropicVersion = "2023-06-01"
@@ -23,6 +26,10 @@ type Client struct {
 	gatewayAuth string // value for cf-aig-authorization (empty = direct to Anthropic)
 	cacheTTL    int    // cf-aig-cache-ttl seconds (0 = gateway default / off)
 	http        *http.Client
+	// sdk is the official Anthropic SDK client, used for the Message Batches API
+	// (submit/poll/stream-results). It is configured with the same base URL and
+	// gateway headers as the hand-rolled sync path.
+	sdk anthropic.Client
 }
 
 // Options configures a Client. Only APIKey, Model, and Timeout are strictly
@@ -54,6 +61,19 @@ func New(o Options) *Client {
 	if o.GatewayToken != "" {
 		gwAuth = "Bearer " + o.GatewayToken
 	}
+
+	// SDK client for the Batches API: same base URL and auth, plus the gateway
+	// header when present. No per-request timeout — batch polls can run long and
+	// are bounded by the caller's context instead.
+	sdkOpts := []option.RequestOption{
+		option.WithAPIKey(o.APIKey),
+		option.WithBaseURL(strings.TrimRight(base, "/") + "/"),
+		option.WithHTTPClient(&http.Client{}),
+	}
+	if gwAuth != "" {
+		sdkOpts = append(sdkOpts, option.WithHeader("cf-aig-authorization", gwAuth))
+	}
+
 	return &Client{
 		apiKey:      o.APIKey,
 		model:       o.Model,
@@ -62,6 +82,7 @@ func New(o Options) *Client {
 		gatewayAuth: gwAuth,
 		cacheTTL:    o.CacheTTLSeconds,
 		http:        &http.Client{Timeout: o.Timeout},
+		sdk:         anthropic.NewClient(sdkOpts...),
 	}
 }
 
@@ -145,17 +166,7 @@ func (c *Client) Decide(ctx context.Context, model, system, userPayload string) 
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
 	}
-	req.Header.Set("x-api-key", c.apiKey)
-	req.Header.Set("anthropic-version", anthropicVersion)
-	req.Header.Set("content-type", "application/json")
-	// Cloudflare AI Gateway: authenticate to the gateway and (optionally) set a
-	// response cache TTL. Both are no-ops when going direct to Anthropic.
-	if c.gatewayAuth != "" {
-		req.Header.Set("cf-aig-authorization", c.gatewayAuth)
-	}
-	if c.cacheTTL > 0 {
-		req.Header.Set("cf-aig-cache-ttl", strconv.Itoa(c.cacheTTL))
-	}
+	c.setHeaders(req, true)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -175,10 +186,32 @@ func (c *Client) Decide(ctx context.Context, model, system, userPayload string) 
 	if err := json.Unmarshal(body, &mr); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
+	return resultFromMessage(&mr, model)
+}
+
+// setHeaders applies the auth/version (and gateway) headers shared by the sync
+// and batch paths. Set content for requests with a JSON body.
+func (c *Client) setHeaders(req *http.Request, content bool) {
+	req.Header.Set("x-api-key", c.apiKey)
+	req.Header.Set("anthropic-version", anthropicVersion)
+	if content {
+		req.Header.Set("content-type", "application/json")
+	}
+	// Cloudflare AI Gateway: authenticate to the gateway and (optionally) set a
+	// response cache TTL. Both are no-ops when going direct to Anthropic.
+	if c.gatewayAuth != "" {
+		req.Header.Set("cf-aig-authorization", c.gatewayAuth)
+	}
+	if c.cacheTTL > 0 {
+		req.Header.Set("cf-aig-cache-ttl", strconv.Itoa(c.cacheTTL))
+	}
+}
+
+// resultFromMessage turns a decoded Messages response into a parsed Result.
+func resultFromMessage(mr *messagesResponse, model string) (*Result, error) {
 	if mr.Error != nil {
 		return nil, fmt.Errorf("messages api error %s: %s", mr.Error.Type, mr.Error.Message)
 	}
-
 	var sb strings.Builder
 	for _, block := range mr.Content {
 		if block.Type == "text" {
@@ -189,7 +222,6 @@ func (c *Client) Decide(ctx context.Context, model, system, userPayload string) 
 	if text == "" {
 		return nil, fmt.Errorf("empty model response")
 	}
-
 	decisions, err := parseDecisions(text)
 	if err != nil {
 		return nil, fmt.Errorf("parse decisions: %w (raw: %q)", err, truncate(text, 500))

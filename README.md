@@ -30,7 +30,7 @@ Queue removal is reversible by nature (re-search) and capped by `queue.max_remov
 go build -o arr-reconciler ./cmd/reconciler
 ```
 
-No third-party dependencies — the standard library only, so the build is hermetic and `go.sum` is empty.
+The only third-party dependency is the official [Anthropic Go SDK](https://github.com/anthropics/anthropic-sdk-go), used for the Message Batches API; everything else (HTTP to the arr instances, Ollama, Datadog, the synchronous Messages path) is plain standard library.
 
 ## Develop
 
@@ -136,6 +136,10 @@ Each task uses a model matched to its risk and complexity (all overridable in `c
 - **`model`** (default `claude-sonnet-4-6`) — fallback when a per-task model is unset.
 
 Candidate payloads are kept minimal and continuous values are bucketed (age, size), so an unchanged set of candidates serializes identically across runs — letting the AI Gateway response cache hit instead of drifting every run.
+
+### Batch mode (50% cheaper)
+
+Set `claude.batch_mode: true` to route triage through the [Anthropic Message Batches API](https://docs.claude.com/en/docs/build-with-claude/batch-processing) instead of synchronous calls. Each run submits one batch per path, polls until it ends (`batch_poll_interval`, bounded by `batch_timeout`), then applies the decisions. Token cost is **half** of synchronous, in exchange for latency — batches usually finish in minutes (hard cap 24h), which suits a periodic daemon. Defaults to off (synchronous). Works the same through the Cloudflare AI Gateway; only the results download goes direct to Anthropic (the API returns an absolute `results_url`).
 
 ## Tiered triage funnel
 

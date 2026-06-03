@@ -27,9 +27,13 @@ RENDERED=/etc/arr-reconciler/config.json
 # candidate then escalates straight to the frontier model.
 : "${LOCAL_ENDPOINT:=}"
 
+# Anthropic Message Batches API (50% cheaper, async). Default off (synchronous).
+# Must render to a bare JSON boolean (true/false), so default it explicitly.
+: "${CLAUDE_BATCH_MODE:=false}"
+
 # Only substitute the variables we explicitly name, so a literal $ elsewhere in
 # the template is left untouched.
-envsubst '${CLAUDE_API_KEY} ${CLAUDE_BASE_URL} ${CLAUDE_GATEWAY_TOKEN} ${SONARR_API_KEY} ${RADARR_API_KEY} ${LLMOBS_ENDPOINT} ${ML_APP} ${LOCAL_ENDPOINT}' \
+envsubst '${CLAUDE_API_KEY} ${CLAUDE_BASE_URL} ${CLAUDE_GATEWAY_TOKEN} ${SONARR_API_KEY} ${RADARR_API_KEY} ${LLMOBS_ENDPOINT} ${ML_APP} ${LOCAL_ENDPOINT} ${CLAUDE_BATCH_MODE}' \
 	< "$TEMPLATE" > "$RENDERED"
 
 exec /usr/local/bin/arr-reconciler -config "$RENDERED" "$@"

@@ -3,6 +3,8 @@ package local
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -115,4 +117,91 @@ func TestClassifyUnknownLabelIsUncertain(t *testing.T) {
 	if got["a"] != Uncertain {
 		t.Errorf("unknown label must be Uncertain, got %s", got["a"])
 	}
+}
+
+// Many items must be split into multiple /api/chat calls, and a single failing
+// batch must only leave its own items Uncertain (the rest still classify).
+func TestClassifyBatchesAndIsolatesFailures(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		body, _ := io.ReadAll(r.Body)
+		// Fail the 2nd batch only.
+		if calls == 2 {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		// Echo back every id seen in this batch as "keep".
+		var req struct {
+			Messages []struct{ Content string } `json:"messages"`
+		}
+		json.Unmarshal(body, &req)
+		var results []map[string]string
+		for _, line := range splitLines(req.Messages[len(req.Messages)-1].Content) {
+			if id := idFromLine(line); id != "" {
+				results = append(results, map[string]string{"id": id, "label": "keep"})
+			}
+		}
+		content, _ := json.Marshal(map[string]any{"results": results})
+		json.NewEncoder(w).Encode(map[string]any{"message": map[string]string{"content": string(content)}})
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "m", 5*time.Second)
+	// 45 items -> 3 batches of 20/20/5.
+	var items []Item
+	for i := 0; i < 45; i++ {
+		items = append(items, Item{Ref: fmt.Sprintf("o%d", i)})
+	}
+	got := c.Classify(context.Background(), items)
+
+	if calls != 3 {
+		t.Errorf("expected 3 batches, got %d calls", calls)
+	}
+	// Batch 1 (o0-o19) = keep, batch 2 (o20-o39) failed = Uncertain, batch 3 (o40-o44) = keep.
+	if got["o0"] != Keep || got["o19"] != Keep {
+		t.Error("batch 1 should be keep")
+	}
+	if got["o25"] != Uncertain {
+		t.Errorf("failed batch 2 must stay Uncertain, got %s", got["o25"])
+	}
+	if got["o44"] != Keep {
+		t.Errorf("batch 3 should be keep, got %s", got["o44"])
+	}
+}
+
+func splitLines(s string) []string {
+	var out, cur = []string{}, ""
+	for _, r := range s {
+		if r == '\n' {
+			out = append(out, cur)
+			cur = ""
+		} else {
+			cur += string(r)
+		}
+	}
+	return append(out, cur)
+}
+
+func idFromLine(line string) string {
+	// line like "- id=o5: ..."
+	i := indexOf(line, "id=")
+	if i < 0 {
+		return ""
+	}
+	rest := line[i+3:]
+	j := indexOf(rest, ":")
+	if j < 0 {
+		return ""
+	}
+	return rest[:j]
+}
+
+func indexOf(s, sub string) int {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return i
+		}
+	}
+	return -1
 }

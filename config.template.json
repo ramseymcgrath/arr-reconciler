@@ -52,7 +52,10 @@
     "max_tokens": 4096,
     "base_url": "${CLAUDE_BASE_URL}",
     "gateway_token": "${CLAUDE_GATEWAY_TOKEN}",
-    "cache_ttl": "1h"
+    "cache_ttl": "1h",
+    "batch_mode": ${CLAUDE_BATCH_MODE},
+    "batch_poll_interval": "30s",
+    "batch_timeout": "1h"
   },
 
   "notify": {

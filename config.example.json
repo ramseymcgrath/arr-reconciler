@@ -52,7 +52,10 @@
     "max_tokens": 4096,
     "base_url": "https://api.anthropic.com",
     "gateway_token": "",
-    "cache_ttl": "1h"
+    "cache_ttl": "1h",
+    "batch_mode": false,
+    "batch_poll_interval": "30s",
+    "batch_timeout": "1h"
   },
 
   "notify": {
